@@ -1,0 +1,10 @@
+# Competition dataset (download separately)
+6ab10eb3b23ba_student_resource.zip
+*.zip
+
+# Generated outputs
+output/
+
+# Local / IDE
+.cursor/
+.DS_Store
