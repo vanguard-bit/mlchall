@@ -1,50 +1,75 @@
-"""Score v6's candidate lists with the v7 matcher.
+"""Score the India slice candidate lists with lgbm_v7r.
 
-Two workers, one batch of texts at a time. Same memory pattern as v6.
-The candidate file is hardlinked from output/v6.
+Two workers, one candidate file each. Writes every pair score so the
+competition model can decode without scoring again.
 """
 
 from __future__ import annotations
 
-import os
+import multiprocessing as mp
 import time
 
 import lightgbm as lgb
 import numpy as np
 
-from decode import decode_greedy_f05
 from pair_features import features_prepared, prepare_record
-from paths import DATA_DIR, ROOT
-from score_v3 import FLUSH_PAIRS, count_lines, load_s1, load_texts
-from score_v6 import COUNTRIES, PARTS, _load_extra, load_cache, shown_name
+from paths import DATA_DIR
+from score_v6 import load_cache, shown_name
 from v4_features import extra_nine, name_five, name_view, parse_addr, particle_two
 from v7_features import city_token, city_two, document_frequency, idf_table, rare_two
 
-OUT = ROOT / "output" / os.environ.get("SCORE_OUT", "v7")
-V6 = ROOT / "output" / "v6"
-MODEL = DATA_DIR / "scoreboard" / os.environ.get("SCORE_MODEL", "lgbm_v7.txt")
-MIN_GAIN = float(os.environ.get("SCORE_MIN_GAIN", "0.70"))
-SCORE_WORKERS = 2
+PARTS = DATA_DIR / "india_slice"
+TRAIN = DATA_DIR / "train"
+MODEL = DATA_DIR / "scoreboard" / "lgbm_v7r.txt"
 BATCH_S1 = 8_000
+FLUSH_PAIRS = 40_000
+WORKERS = 2
 
 IDF: dict[str, float] = {}
 MISSING_IDF = 1.0
 
 
+def _load_s1() -> dict[str, tuple[str, str, str]]:
+    rows: dict[str, tuple[str, str, str]] = {}
+    with (TRAIN / "train_source1.tsv").open(encoding="utf-8") as handle:
+        handle.readline()
+        for line in handle:
+            eid, name, addr, country = line.rstrip("\n").split("\t")
+            if country == "India":
+                rows[eid] = (name, addr, country)
+    return rows
+
+
+def _load_texts(need: set[str]) -> dict[str, tuple[str, str, str]]:
+    texts: dict[str, tuple[str, str, str]] = {}
+    if not need:
+        return texts
+    for name in ("train_source2.tsv", "train_source3.tsv"):
+        with (TRAIN / name).open(encoding="utf-8") as handle:
+            handle.readline()
+            for line in handle:
+                eid = line.split("\t", 1)[0]
+                if eid not in need:
+                    continue
+                _eid, bname, addr, country = line.rstrip("\n").split("\t")
+                texts[eid] = (bname, addr, country)
+                if len(texts) == len(need):
+                    return texts
+    return texts
+
+
 def _prepare_idf() -> None:
+    if IDF:
+        return
     counts, n_docs = document_frequency()
-    IDF.clear()
     IDF.update(idf_table(counts, n_docs))
     print(f"idf tokens {len(IDF)}", flush=True)
 
 
-def score_span(args: tuple[str, int, int, str]) -> int:
-    country, start, end, dest = args
+def score_file(wid: int) -> int:
     load_cache()
-    if not IDF:
-        _prepare_idf()
-    s1 = load_s1()
-    extra = _load_extra(country)
+    _prepare_idf()
+    s1 = _load_s1()
     booster = lgb.Booster(model_file=str(MODEL))
     trees = booster.best_iteration if booster.best_iteration and booster.best_iteration > 0 else booster.num_trees()
     empty_rec = prepare_record("", "")
@@ -54,8 +79,9 @@ def score_span(args: tuple[str, int, int, str]) -> int:
     pending_sid: list[str] = []
     pending_mids: list[list[str]] = []
     written = 0
-    shard = PARTS / f"{country}.cands.tsv"
-    out = open(dest, "w", encoding="utf-8")
+    src = PARTS / f"cands_{wid}.tsv"
+    dest = PARTS / f"scores_{wid}.tsv"
+    out = dest.open("w", encoding="utf-8")
 
     def flush() -> None:
         nonlocal written
@@ -64,10 +90,10 @@ def score_span(args: tuple[str, int, int, str]) -> int:
         pred = booster.predict(np.asarray(pending_x, dtype=np.float32), num_iteration=trees)
         cursor = 0
         for sid, mids in zip(pending_sid, pending_mids):
-            part = [float(x) for x in pred[cursor : cursor + len(mids)]]
+            part = pred[cursor : cursor + len(mids)]
             cursor += len(mids)
-            chosen = decode_greedy_f05(mids, part, min_gain=MIN_GAIN, max_preds=12)
-            out.write(f"{sid}\t{','.join(mid for mid in mids if mid in chosen)}\n")
+            body = ";".join(f"{mid}|{float(score):.6f}" for mid, score in zip(mids, part))
+            out.write(f"{sid}\t{body}\n")
             written += 1
         pending_x.clear()
         pending_sid.clear()
@@ -89,14 +115,8 @@ def score_span(args: tuple[str, int, int, str]) -> int:
                     seen.add(mid)
                     bits.append((mid, bit))
                     need.add(mid)
-            for mid in extra.get(sid, []):
-                if mid in seen:
-                    continue
-                seen.add(mid)
-                bits.append((mid, f"{mid}|1|99|1|0|1|0"))
-                need.add(mid)
             parsed.append((sid, bits))
-        texts = load_texts(need)
+        texts = _load_texts(need)
         prepared = {}
         names = {}
         addrs = {}
@@ -151,72 +171,28 @@ def score_span(args: tuple[str, int, int, str]) -> int:
         flush()
 
     batch: list[str] = []
-    with shard.open(encoding="utf-8") as handle:
-        for i, line in enumerate(handle):
-            if i < start:
-                continue
-            if i >= end:
-                break
+    with src.open(encoding="utf-8") as handle:
+        for line in handle:
             batch.append(line)
             if len(batch) >= BATCH_S1:
                 score_batch(batch)
                 batch = []
-                print(f"  {country} {start}:{end} {written}", flush=True)
+                print(f"  w{wid} {written}", flush=True)
         if batch:
             score_batch(batch)
     out.close()
-    print(f"{country} {start}:{end} wrote {written}", flush=True)
+    print(f"w{wid} wrote {written}", flush=True)
     return written
 
 
 def main() -> None:
-    import multiprocessing as mp
-
     t0 = time.time()
-    print(f"out {OUT} model {MODEL.name} min_gain {MIN_GAIN}", flush=True)
     if not MODEL.exists():
         raise SystemExit(f"missing {MODEL}")
-    for country in COUNTRIES:
-        path = V6 / "extra" / f"{country}.tsv"
-        if not path.exists():
-            raise SystemExit(f"missing {path}")
-    counts = {country: count_lines(PARTS / f"{country}.cands.tsv") for country in COUNTRIES}
-    if sum(counts.values()) != 1_732_544:
-        raise SystemExit(f"candidate shards sum to {sum(counts.values())}")
-    OUT.mkdir(parents=True, exist_ok=True)
-    part_dir = OUT / "parts"
-    part_dir.mkdir(parents=True, exist_ok=True)
-    match_path = OUT / "matching_results.tsv"
     ctx = mp.get_context("spawn")
-    with match_path.open("w", encoding="utf-8") as match_out:
-        match_out.write("source1_entity_id\tmatched_entity_ids\n")
-        for country, n_lines in counts.items():
-            mid = n_lines // SCORE_WORKERS
-            spans = [
-                (country, 0, mid, str(part_dir / f"{country}_0.tsv")),
-                (country, mid, n_lines, str(part_dir / f"{country}_1.tsv")),
-            ]
-            with ctx.Pool(SCORE_WORKERS) as pool:
-                wrote = pool.map(score_span, spans)
-            print(f"{country} parts {wrote}", flush=True)
-            for _country, _start, _end, part in spans:
-                with open(part, encoding="utf-8") as handle:
-                    for line in handle:
-                        match_out.write(line)
-                os.remove(part)
-    n_rows = count_lines(match_path) - 1
-    src = V6 / "candidate_pairs.tsv"
-    dest = OUT / "candidate_pairs.tsv"
-    if count_lines(src) - 1 == 1_732_544:
-        if dest.exists() or dest.is_symlink():
-            dest.unlink()
-        os.link(src, dest)
-        print(f"linked candidates from {src}", flush=True)
-    else:
-        print(f"v6 candidates not complete ({src})", flush=True)
-    print(f"wrote {n_rows} rows in {time.time() - t0:.0f}s", flush=True)
-    if n_rows != 1_732_544:
-        raise SystemExit(f"row count {n_rows}")
+    with ctx.Pool(WORKERS) as pool:
+        wrote = pool.map(score_file, range(WORKERS))
+    print(f"scored {sum(wrote)} in {time.time() - t0:.0f}s", flush=True)
 
 
 if __name__ == "__main__":

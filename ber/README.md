@@ -17,3 +17,5 @@ $MLCHALL_ROOT/ber/.venv/bin/python export_test.py
 Run only one full-corpus zip scan at a time (~6GB RAM headroom recommended).
 
 Default zip: `$MLCHALL_ROOT/6ab10eb3b23ba_student_resource.zip`
+
+Final submission package (v7rx, public 0.910): `submission/`. Build the zip with `submission/make_zip.sh <team_name>`.
