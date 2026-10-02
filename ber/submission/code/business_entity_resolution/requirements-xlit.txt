@@ -1,8 +1,0 @@
-# Python 3.12.13. Separate environment for the IndicXlit step (xlit_words.py) only.
-# fairseq 0.12.2 has no Python 3.12 wheel; build it from the v0.12.2 source tag.
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.14.0+cpu
-fairseq==0.12.2
-ai4bharat-transliteration==1.1.3
-indic-nlp-library==0.92
-numpy==2.5.3

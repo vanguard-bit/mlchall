@@ -1,6 +1,0 @@
-# Python 3.12.13. Main pipeline environment.
-lightgbm==4.7.0
-numpy==2.5.3
-pyarrow==25.0.1
-RapidFuzz==3.14.6
-scipy==1.18.1

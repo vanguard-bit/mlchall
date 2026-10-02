@@ -8,3 +8,6 @@ output/
 # Local / IDE
 .cursor/
 .DS_Store
+
+# Local submission package
+ber/submission/
